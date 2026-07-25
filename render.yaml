@@ -1,0 +1,20 @@
+# Render Blueprint. Deploy: push this repo to GitHub, then in Render
+# dashboard "New +" -> "Blueprint", point at the repo, and Render reads this
+# file. Set API_KEY / READ_API_KEY / DATABASE_URL as secret env vars in the
+# Render dashboard (sync: false below means Render will prompt for them
+# rather than trying to read values out of this file).
+services:
+  - type: web
+    name: env-logger-ingest
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: READ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
