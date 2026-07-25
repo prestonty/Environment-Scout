@@ -23,25 +23,26 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <time.h>
+#include "secrets.h"    // gitignored -- see secrets.h.example
 
 // ═══ CONFIGURATION ═════════════════════════════════════════════════════════
 
 // --- Access point the phone connects to (this is what the QR code encodes) ---
 const char *AP_SSID = "scout-361";
-const char *AP_PASS = "yourPassword";      // must be 8+ chars
+const char *AP_PASS = SECRET_AP_PASS;      // must be 8+ chars
 
 // --- Uplink to the internet, for database uploads + clock sync ---
 // Leave STA_SSID empty ("") to run AP-only. The device still logs and still
 // serves downloads; it just never uploads and has no wall clock.
-const char *STA_SSID = "Tenda_992690_5G";
-const char *STA_PASS = "Horseman";
+const char *STA_SSID = SECRET_STA_SSID;
+const char *STA_PASS = SECRET_STA_PASS;
 
 // --- Central database endpoint ---
 // Must be https:// - the ingest server only accepts TLS connections, and the
 // API key travels as a plaintext header, so HTTPS is what actually keeps it
 // secret in transit.
 const char *UPLOAD_URL = "https://your-server.example.com/api/readings";
-const char *UPLOAD_KEY = "replace-with-your-api-key";
+const char *UPLOAD_KEY = SECRET_UPLOAD_KEY;
 const char *DEVICE_ID  = "esp32-node-01";
 
 // --- Timing ---

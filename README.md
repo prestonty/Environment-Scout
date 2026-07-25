@@ -36,11 +36,13 @@ Postgres, and exposes a read-back endpoint for verification.
 
 1. **Create the Supabase project**, then in the SQL editor run
    [schema.sql](schema.sql).
-2. **Get the direct (non-pooler) connection string**: Project Settings →
-   Database → Connection string → URI, port 5432. Use the direct connection,
-   not the pgbouncer transaction pooler — asyncpg's prepared statements
-   don't work reliably under transaction-mode pooling, and at one
-   upload/day a single small connection pool is plenty.
+2. **Get the connection string**: click **Connect** on the project, then the
+   **Session pooler** tab. Not "Direct connection" (Supabase requires IPv6 or
+   a paid IPv4 add-on for that, and Render's outbound networking is IPv4-only
+   anyway) and not "Transaction pooler" (that recycles backend connections
+   mid-session, which breaks asyncpg's prepared statements). Session pooler
+   is IPv4-compatible and gives each connection a dedicated backend for its
+   session, so prepared statements still work fine.
 3. **Copy `.env.example` to `.env`** and fill in `API_KEY` (generate with
    `python -c "import secrets; print(secrets.token_urlsafe(32))"`) and
    `DATABASE_URL`.
@@ -65,8 +67,15 @@ Postgres, and exposes a read-back endpoint for verification.
 
 ## Point the firmware at it
 
-In [Project_Code_361.ino](Project_Code_361/Project_Code_361.ino), the only
-change needed is already applied:
+Credentials (`SECRET_AP_PASS`, `SECRET_STA_SSID`, `SECRET_STA_PASS`,
+`SECRET_UPLOAD_KEY`) live in `Project_Code_361/secrets.h`, which is
+gitignored — the `.ino` only references the macro names. Copy
+[secrets.h.example](Project_Code_361/secrets.h.example) to `secrets.h` in
+that same folder and fill in real values; the Arduino IDE picks up
+same-folder headers automatically.
+
+In [Project_Code_361.ino](Project_Code_361/Project_Code_361.ino) itself, the
+only change needed is already applied:
 
 - `UPLOAD_URL` is now expected to be `https://...` (was `http://...`).
 - `WiFiClientSecure` + `client.setInsecure()` is used for the POST, so no CA

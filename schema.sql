@@ -28,3 +28,9 @@ create unique index if not exists uq_reading
 -- Primary query pattern: latest rows for one device.
 create index if not exists idx_readings_device_time
   on readings (device_id, received_at desc);
+
+-- The app connects with the postgres role (BYPASSRLS), so this has no effect
+-- on it. It's here to stop Supabase's PostgREST API from exposing this table
+-- to anyone holding the project's anon key -- no policies are added, so RLS
+-- denies that path entirely by default.
+alter table readings enable row level security;
