@@ -16,6 +16,7 @@ export interface ReadingsQuery {
   since?: string;
   until?: string;
   limit: number;
+  deviceId?: string;
 }
 
 export interface Photo {
@@ -34,6 +35,7 @@ export interface PhotosQuery {
   since?: string;
   until?: string;
   limit: number;
+  deviceId?: string;
 }
 
 export class ApiError extends Error {}
@@ -50,6 +52,7 @@ export async function fetchReadings(query: ReadingsQuery): Promise<Reading[]> {
   const url = new URL("/api/readings", baseUrl);
   if (query.since) url.searchParams.set("since", query.since);
   if (query.until) url.searchParams.set("until", query.until);
+  if (query.deviceId) url.searchParams.set("device_id", query.deviceId);
   url.searchParams.set("limit", String(query.limit));
 
   let res: Response;
@@ -82,6 +85,7 @@ export async function fetchPhotos(query: PhotosQuery): Promise<Photo[]> {
   const url = new URL("/api/photos", baseUrl);
   if (query.since) url.searchParams.set("since", query.since);
   if (query.until) url.searchParams.set("until", query.until);
+  if (query.deviceId) url.searchParams.set("device_id", query.deviceId);
   url.searchParams.set("limit", String(query.limit));
 
   let res: Response;

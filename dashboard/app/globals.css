@@ -95,6 +95,57 @@ body {
   margin: 0 0 4px;
 }
 
+.backLink {
+  align-self: flex-start;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.backLink:hover {
+  color: var(--text-primary);
+}
+
+/* Device list (home page) */
+.deviceList {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.deviceCard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+
+.deviceCard:hover {
+  border-color: var(--series-1);
+}
+
+.deviceName {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.deviceLocation {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.deviceId {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .subtitle {
   margin: 0;
   color: var(--text-secondary);
@@ -370,6 +421,15 @@ tbody tr:hover td {
   object-fit: cover;
 }
 
+.photoOpenBtn {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+}
+
 .photoUnavailable {
   display: flex;
   align-items: center;
@@ -383,5 +443,121 @@ tbody tr:hover td {
 .photoCard figcaption {
   padding: 8px 10px;
   font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* Lightbox */
+.lightboxBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.85);
+  padding: 32px;
+  cursor: zoom-out;
+}
+
+.lightboxFigure {
+  margin: 0;
+  max-width: min(90vw, 1100px);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: default;
+}
+
+.lightboxFigure img {
+  max-width: 100%;
+  max-height: 80vh;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 6px;
+  display: block;
+}
+
+.lightboxFigure figcaption {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #e4e3df;
+}
+
+.lightboxClose {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  font-size: 32px;
+  line-height: 1;
+  color: #fff;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px 10px;
+}
+
+.lightboxClose:hover {
+  color: var(--series-1);
+}
+
+.lightboxNav {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 40px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  border-radius: 50%;
+  width: 48px;
+  height: 48px;
+  cursor: pointer;
+}
+
+.lightboxNav:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.lightboxPrev {
+  left: 16px;
+}
+
+.lightboxNext {
+  right: 16px;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.pageBtn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.pageBtn:hover {
+  border-color: var(--series-1);
+}
+
+.pageBtn.disabled {
+  pointer-events: none;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.pageStatus {
   color: var(--text-secondary);
 }

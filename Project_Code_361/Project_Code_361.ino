@@ -218,8 +218,15 @@ String friendlyTimestamp() {
   struct tm t;
   localtime_r(&now, &t);
   char buf[32];
-  strftime(buf, sizeof(buf), "%b %-d, %-I:%M %p", &t);   // "Jul 25, 2:30 PM"
-  return String(buf);
+  // %-d / %-I ("no leading zero") are a GNU strftime extension the ESP32's
+  // libc doesn't support - it silently emitted garbage bytes for them.
+  // Use the portable zero-padded specifiers and strip the leading zeros here.
+  strftime(buf, sizeof(buf), "%b %d, %I:%M %p", &t);   // "Jul 05, 02:30 PM"
+  String s(buf);
+  if (s.charAt(4) == '0') s.remove(4, 1);               // day: "05" -> "5"
+  int hourPos = s.indexOf(", ") + 2;
+  if (s.charAt(hourPos) == '0') s.remove(hourPos, 1);   // hour: "02" -> "2"
+  return s;                                             // "Jul 5, 2:30 PM"
 }
 
 // ═══ LOGGING ═══════════════════════════════════════════════════════════════
@@ -363,7 +370,12 @@ bool uploadPending() {
   }
 
   f.close();
-  lastUploadStatus = "ok, " + String(batches) + " batches at " + friendlyTimestamp();
+  // "batches" = chunks of the sensor CSV log sent to the server (see
+  // UPLOAD_BATCH above) - nothing to do with photo count, which is reported
+  // separately. Spelled out here since the two numbers sit right next to
+  // each other in the combined /upload-now message and were easy to conflate.
+  lastUploadStatus = "up to date as of " + friendlyTimestamp() +
+                      " (" + String(batches) + (batches == 1 ? " data batch sent)" : " data batches sent)");
   Serial.println("[UP] Upload complete.");
   return true;
 }
@@ -521,6 +533,12 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
  .danger{background:#fff;color:#d70015;border:1px solid #d70015}
  #msg{font-size:13px;color:#0071e3;min-height:18px;text-align:center}
  small{color:#888;font-size:12px}
+ .tip{background:#f2f7ff;border-left:3px solid #0071e3;border-radius:6px;padding:10px 12px;margin-top:8px;font-size:13px;line-height:1.4;color:#333}
+ .badge{font-size:12px;font-weight:600;padding:3px 8px;border-radius:20px;white-space:nowrap}
+ .badge-up{background:#fff4e5;color:#b25e00}
+ .badge-down{background:#e5f2ff;color:#0055b3}
+ .badge-ok{background:#e6f7ea;color:#1a7a33}
+ .badge-nodata{background:#eee;color:#888}
 </style></head><body>
 
 <h1>Environment Monitor</h1>
@@ -548,6 +566,12 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <a class="btn primary" href="/download" download="sensor_data.csv">Download data (CSV)</a>
+<button class="secondary" onclick="document.getElementById('targetFile').click()">Compare to target CSV</button>
+<input type="file" accept=".csv,text/csv" id="targetFile" style="display:none">
+<div id="targetmsg"></div>
+<div id="targetResults" style="display:none">
+  <div class="sub" id="targetHourLabel"></div>
+</div>
 <button class="secondary" onclick="act('/upload-now','Uploading...')">Upload to database now</button>
 <button class="secondary" onclick="document.getElementById('photoFile').click()">Take / choose photo</button>
 <input type="file" accept="image/*" capture="environment" id="photoFile" style="display:none">
@@ -608,6 +632,145 @@ document.getElementById('photoFile').addEventListener('change', async (e) => {
   }catch(err){ msg.textContent = 'Photo upload failed'; }
   poll();
 });
+
+// --- gardening comparison ---
+// Unlike the photoFile input above, this file is never uploaded anywhere -
+// it's read locally with the File API and compared against this device's
+// own log (fetched from /download), then thrown away.
+const METRICS = [
+  { key:'humidity_pct',  label:'Humidity',    unit:'%',       deadband:5   },
+  { key:'temperature_c', label:'Temperature', unit:' &#176;C', deadband:2   },
+  { key:'uv_index_est',  label:'UV index',    unit:'',        deadband:1   },
+  { key:'co2_ppm',       label:'CO&#8322;',   unit:' ppm',    deadband:100 }
+];
+
+const TIPS = {
+  humidity_pct:  { increase: "Mist plants regularly or run a humidifier. Group plants together so their transpiration raises local moisture. Sit pots on a pebble tray filled with water (pot above the waterline). Grow in an enclosed space like a greenhouse, terrarium, or cloche.",
+                    decrease: "Improve air circulation with fans or wider spacing. Ventilate greenhouses through vents and windows. Water less often and keep foliage dry. Run a dehumidifier in enclosed spaces." },
+  temperature_c: { increase: "Use a greenhouse, cold frame, cloche, or polytunnel to trap solar heat. Add heat mats under seed trays or heaters in a greenhouse. Apply dark mulch or place pots against a south-facing wall that radiates stored heat. Warm soil with black plastic before planting.",
+                    decrease: "Provide shade with shade cloth, netting, or taller neighbouring plants. Ventilate and increase airflow. Use light or reflective mulch and water early or late in the day. Damp down a greenhouse floor so evaporation cools the air." },
+  uv_index_est:  { increase: "Move plants to a sunnier, open spot. Remove overhead branches and covers. Use UV-transmitting glass or grow lights that emit UV, since standard glass and most plastics block it. Reflect light onto plants with white or reflective surfaces.",
+                    decrease: "Use shade cloth, netting, or horticultural fleece. Grow under taller plants, pergolas, or structures. Apply shade paint to greenhouse glass in summer. Cover with UV-filtering film." },
+  co2_ppm:       { increase: "In a sealed greenhouse, use a CO&#8322; generator, dry ice, or bottled CO&#8322;. Add well-rotted compost or manure, since decomposition releases CO&#8322; at soil level. Keep air moving so CO&#8322; doesn't deplete around the leaves. Some growers stay closed on cool mornings to let CO&#8322; build before venting.",
+                    decrease: "Ventilate. Opening vents and running fans lets excess CO&#8322; escape and equalise with outdoor air (around 420 ppm)." }
+};
+
+function parseCsv(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);   // strip BOM (Excel exports)
+  const rows = [];
+  for (const raw of text.split(/\r\n|\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('timestamp,')) continue;    // blank line or header
+    const f = line.split(',');
+    if (f.length < 8) continue;                              // malformed/truncated row
+    const ts = f[0].trim();
+    rows.push({
+      hour: ts.length >= 13 ? parseInt(ts.substring(11, 13), 10) : NaN,
+      temperature_c: parseFloat(f[2]),
+      humidity_pct:  parseFloat(f[3]),
+      uv_index_est:  parseFloat(f[6]),
+      co2_ppm:       parseFloat(f[7])
+    });
+  }
+  return rows;
+}
+
+// Buckets by hour-of-day (pooled across all dates in the file) and also
+// keeps an overall mean, so a thin hour can fall back to "any data" per the
+// requested behavior rather than reporting nothing.
+function bucketByHour(rows, key) {
+  const sums = new Array(24).fill(0), counts = new Array(24).fill(0);
+  let overallSum = 0, overallCount = 0;
+  for (const r of rows) {
+    const v = r[key];
+    if (isNaN(v)) continue;
+    if (key === 'co2_ppm' && v === -1) continue;   // sensor warming up, not a real reading
+    overallSum += v; overallCount++;
+    if (!isNaN(r.hour)) { sums[r.hour] += v; counts[r.hour]++; }
+  }
+  const means = new Array(24).fill(null);
+  for (let h = 0; h < 24; h++) if (counts[h] > 0) means[h] = sums[h] / counts[h];
+  return { means, overall: overallCount > 0 ? overallSum / overallCount : null };
+}
+
+function pickValue(bucket, hour) {
+  if (bucket.means[hour] !== null) return { value: bucket.means[hour], fellBack: false };
+  if (bucket.overall !== null) return { value: bucket.overall, fellBack: true };
+  return { value: null, fellBack: false };
+}
+
+function compareAtHour(curB, tgtB, hour, metric) {
+  const cur = pickValue(curB, hour), tgt = pickValue(tgtB, hour);
+  if (cur.value === null || tgt.value === null) return { status: 'no-data' };
+  const delta = cur.value - tgt.value;   // + = current above target
+  const usedFallback = cur.fellBack || tgt.fellBack;
+  if (Math.abs(delta) <= metric.deadband) return { status: 'ok', cur: cur.value, tgt: tgt.value, delta, usedFallback };
+  return { status: delta < 0 ? 'increase' : 'decrease', cur: cur.value, tgt: tgt.value, delta, usedFallback };
+}
+
+function badge(status) {
+  const map = { increase:['&#8593; increase','badge-up'], decrease:['&#8595; decrease','badge-down'],
+                ok:['&#10003; within range','badge-ok'], 'no-data':['no data','badge-nodata'] };
+  const [text, cls] = map[status];
+  return '<span class="badge ' + cls + '">' + text + '</span>';
+}
+
+function renderComparison(ownRows, targetRows) {
+  const hour = new Date().getHours();
+  document.getElementById('targetHourLabel').textContent =
+    'Comparison for ' + String(hour).padStart(2, '0') + ':00';
+
+  const results = document.getElementById('targetResults');
+  results.querySelectorAll('.card').forEach(el => el.remove());
+
+  METRICS.forEach(metric => {
+    const curB = bucketByHour(ownRows, metric.key);
+    const tgtB = bucketByHour(targetRows, metric.key);
+    const cmp = compareAtHour(curB, tgtB, hour, metric);
+
+    const div = document.createElement('div');
+    div.className = 'card';
+    let html = '<div class="row"><span class="lbl">' + metric.label + '</span><span class="val">' + badge(cmp.status) + '</span></div>';
+    if (cmp.status === 'no-data') {
+      html += '<div class="row"><span class="lbl">Not enough data logged for this metric yet</span></div>';
+    } else {
+      if (cmp.usedFallback) html += '<div class="row"><span class="lbl"><small>using overall average - not enough data for this hour</small></span></div>';
+      html += '<div class="row"><span class="lbl">Current</span><span class="val">' + cmp.cur.toFixed(1) + metric.unit + '</span></div>';
+      html += '<div class="row"><span class="lbl">Target</span><span class="val">'  + cmp.tgt.toFixed(1) + metric.unit + '</span></div>';
+      html += '<div class="row"><span class="lbl">Delta</span><span class="val">'   + (cmp.delta >= 0 ? '+' : '') + cmp.delta.toFixed(1) + metric.unit + '</span></div>';
+      if (cmp.status !== 'ok') html += '<div class="tip">' + TIPS[metric.key][cmp.status] + '</div>';
+    }
+    div.innerHTML = html;
+    results.appendChild(div);
+  });
+
+  results.style.display = 'block';
+}
+
+document.getElementById('targetFile').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';   // let the same file be re-picked later
+  if (!file) return;
+  const msg = document.getElementById('targetmsg');
+  document.getElementById('targetResults').style.display = 'none';
+  msg.textContent = 'Reading target file...';
+  try {
+    const targetRows = parseCsv(await file.text());
+    if (targetRows.length === 0) { msg.textContent = 'No usable rows in that file.'; return; }
+
+    msg.textContent = 'Fetching current log...';
+    const r = await fetch('/download');
+    if (!r.ok) throw new Error('download failed (' + r.status + ')');
+    const ownRows = parseCsv(await r.text());
+    if (ownRows.length === 0) { msg.textContent = 'No data logged on this device yet.'; return; }
+
+    renderComparison(ownRows, targetRows);
+    msg.textContent = '';
+  } catch (err) {
+    msg.textContent = 'Comparison failed: ' + err.message;
+  }
+});
+
 syncTime().then(poll); setInterval(poll, 2000);
 </script>
 </body></html>
@@ -697,7 +860,7 @@ void handleDownload() {
 void handleUploadNow() {
   bool ok = uploadPending();
   bool photosOk = uploadPendingPhotos();
-  String msg = ok ? ("Upload: " + lastUploadStatus) : ("Upload failed: " + lastUploadStatus);
+  String msg = ok ? ("Sensor data: " + lastUploadStatus) : ("Sensor data upload failed: " + lastUploadStatus);
   msg += photosOk ? " | Photos: up to date" : " | Photos: some failed, will retry";
   server.send(200, "text/plain", msg);
 }
