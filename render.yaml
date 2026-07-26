@@ -18,3 +18,9 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_PHOTOS_BUCKET
+        sync: false

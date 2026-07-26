@@ -34,3 +34,30 @@ create index if not exists idx_readings_device_time
 -- to anyone holding the project's anon key -- no policies are added, so RLS
 -- denies that path entirely by default.
 alter table readings enable row level security;
+
+-- Photos captured from the phone at the captive portal, relayed to the
+-- ingest server by the ESP32 the same way readings are. The image bytes
+-- live in a private Supabase Storage bucket (see server.py); this table
+-- only holds metadata + the object's path within that bucket.
+create table if not exists photos (
+  id                   bigint generated always as identity primary key,
+  device_id            text        not null,
+  filename             text        not null,   -- dedupe key; also the Storage object name
+  taken_at             timestamptz,             -- NULL if device clock was unsynced at capture
+  content_type         text        not null default 'image/jpeg',
+  size_bytes           integer     not null,
+  storage_path         text        not null,    -- "<device_id>/<filename>" in the bucket
+  received_at          timestamptz not null default now()
+);
+
+-- Dedupe key: filename already embeds a per-device sequence number from the
+-- firmware, so a retried relay of the same file is a no-op rather than a
+-- duplicate row.
+create unique index if not exists uq_photo
+  on photos (device_id, filename);
+
+-- Primary query pattern: latest photos for one device.
+create index if not exists idx_photos_device_time
+  on photos (device_id, received_at desc);
+
+alter table photos enable row level security;

@@ -41,7 +41,8 @@ const char *STA_PASS = SECRET_STA_PASS;
 // Must be https:// - the ingest server only accepts TLS connections, and the
 // API key travels as a plaintext header, so HTTPS is what actually keeps it
 // secret in transit.
-const char *UPLOAD_URL = "https://your-server.example.com/api/readings";
+const char *UPLOAD_URL = "https://env-logger-ingest.onrender.com/api/readings";
+const char *PHOTO_UPLOAD_URL = "https://env-logger-ingest.onrender.com/api/photos";
 const char *UPLOAD_KEY = SECRET_UPLOAD_KEY;
 const char *DEVICE_ID  = "esp32-node-01";
 
@@ -75,6 +76,13 @@ const char *CSV_HEADER =
 
 const size_t UPLOAD_BATCH = 2048;   // bytes per POST
 
+// --- Photos ---
+// Each captured photo is its own file, named "<epoch_or_0>_<seq>.jpg" -
+// the epoch (0 if the clock wasn't synced yet) doubles as the taken-at
+// metadata, since there's no shared header row to piggyback on like the CSV.
+const char *PHOTO_QUEUE_DIR   = "/photoq";
+const size_t MAX_PHOTO_BYTES  = 15UL * 1024 * 1024;   // guard against filling the card
+
 // ═══ GLOBALS ═══════════════════════════════════════════════════════════════
 
 WebServer server(80);
@@ -101,6 +109,13 @@ int lastClearMon      = -1;
 String lastUploadStatus = "never";
 
 bool sdReady = false;
+
+// --- Photo upload-in-progress state (used by handlePhotoUpload) ---
+uint32_t photoSeq        = 0;      // persisted in NVS, guarantees unique filenames across reboots
+String   photoUploadPath;
+File     photoUploadFile;
+bool     photoUploadOk    = true;
+size_t   photoUploadBytes = 0;
 
 // ═══ SD CARD ═══════════════════════════════════════════════════════════════
 
@@ -194,6 +209,16 @@ String isoTimestamp() {
   localtime_r(&now, &t);
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
+  return String(buf);
+}
+
+String friendlyTimestamp() {
+  if (!timeIsSynced()) return "unknown time";
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%b %-d, %-I:%M %p", &t);   // "Jul 25, 2:30 PM"
   return String(buf);
 }
 
@@ -338,9 +363,98 @@ bool uploadPending() {
   }
 
   f.close();
-  lastUploadStatus = "ok, " + String(batches) + " batches at " + isoTimestamp();
+  lastUploadStatus = "ok, " + String(batches) + " batches at " + friendlyTimestamp();
   Serial.println("[UP] Upload complete.");
   return true;
+}
+
+// ═══ PHOTOS ════════════════════════════════════════════════════════════════
+
+// Pulls the capture-time epoch back out of a queue filename and formats it
+// the same way isoTimestamp() formats "now" - a naive local-time string,
+// because that's exactly what the ingest server's timestamp parsing expects
+// (see server.py's _parse_timestamp / DEVICE_TZ). Returns "" if the photo
+// was captured before the clock was ever synced (filename epoch is 0).
+String photoTakenAtHeader(const String &filename) {
+  int us = filename.indexOf('_');
+  if (us <= 0) return "";
+  long epoch = filename.substring(0, us).toInt();
+  if (epoch <= 0) return "";
+  time_t t = (time_t)epoch;
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmv);
+  return String(buf);
+}
+
+int countPendingPhotos() {
+  if (!sdReady) return 0;
+  File dir = SD.open(PHOTO_QUEUE_DIR);
+  if (!dir) return 0;
+  int n = 0;
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    if (!entry.isDirectory()) n++;
+    entry.close();
+  }
+  dir.close();
+  return n;
+}
+
+// Relays every file in PHOTO_QUEUE_DIR to the ingest server, one whole file
+// per POST (streamed straight off the SD card, never buffered fully in
+// RAM). Unlike uploadPending() there's no byte offset to persist - a
+// photo's mere presence in the queue directory IS the "still pending"
+// state, so a confirmed (2xx) upload just deletes the file.
+bool uploadPendingPhotos() {
+  if (!sdReady) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  File dir = SD.open(PHOTO_QUEUE_DIR);
+  if (!dir) return true;   // queue directory doesn't exist yet -> nothing pending
+
+  bool allOk = true;
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    if (entry.isDirectory()) { entry.close(); continue; }
+
+    String name = entry.name();
+    int slash = name.lastIndexOf('/');
+    if (slash >= 0) name = name.substring(slash + 1);
+    size_t fsize = entry.size();
+    entry.close();
+
+    String path = String(PHOTO_QUEUE_DIR) + "/" + name;
+    String takenAt = photoTakenAtHeader(name);
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) continue;
+
+    // See uploadPending() for the rationale on setInsecure().
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, PHOTO_UPLOAD_URL);
+    http.addHeader("Content-Type", "image/jpeg");
+    http.addHeader("X-API-Key", UPLOAD_KEY);
+    http.addHeader("X-Device-Id", DEVICE_ID);
+    http.addHeader("X-Filename", name);
+    if (takenAt.length()) http.addHeader("X-Taken-At", takenAt);
+
+    int code = http.sendRequest("POST", &f, fsize);
+    http.end();
+    f.close();
+
+    if (code >= 200 && code < 300) {
+      SD.remove(path);
+      Serial.printf("[PHOTO] Uploaded and cleared %s\n", name.c_str());
+    } else {
+      Serial.printf("[PHOTO] Upload FAILED for %s (HTTP %d) - will retry later.\n", name.c_str(), code);
+      allOk = false;
+    }
+  }
+  dir.close();
+  return allOk;
 }
 
 // ═══ SCHEDULING ════════════════════════════════════════════════════════════
@@ -352,6 +466,7 @@ void checkSchedules() {
     if (millis() - lastFallbackUpload >= 86400000UL) {
       lastFallbackUpload = millis();
       uploadPending();
+      uploadPendingPhotos();
     }
     return;
   }
@@ -367,6 +482,7 @@ void checkSchedules() {
       lastUploadYday = t.tm_yday;
       prefs.putInt("upYday", lastUploadYday);
     }
+    uploadPendingPhotos();
   }
 
   // --- Monthly clear, gated on the upload being fully caught up ---
@@ -427,12 +543,18 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
   <div class="row"><span class="lbl">Last upload</span><span class="val" id="up">--</span></div>
 </div>
 
+<div class="card">
+  <div class="row"><span class="lbl">Photos queued</span><span class="val" id="photopend">--</span></div>
+</div>
+
 <a class="btn primary" href="/download" download="sensor_data.csv">Download data (CSV)</a>
 <button class="secondary" onclick="act('/upload-now','Uploading...')">Upload to database now</button>
+<button class="secondary" onclick="document.getElementById('photoFile').click()">Take / choose photo</button>
+<input type="file" accept="image/*" capture="environment" id="photoFile" style="display:none">
+<div id="photomsg"></div>
 <button class="danger" onclick="confirmClear()">Erase log on SD card</button>
 <div id="msg"></div>
-<p><small>UV index is a clear-sky daylight estimate, not a calibrated measurement.
-If the download does not start, open this page in your normal browser at 192.168.4.1</small></p>
+<p><small>UV index is a clear-sky daylight estimate, not a calibrated measurement.</small></p>
 
 <script>
 function fmt(b){return b>1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+' KB';}
@@ -450,6 +572,7 @@ async function poll(){
     document.getElementById('pend').textContent= fmt(d.pending);
     document.getElementById('net').textContent = d.online ? 'connected' : 'offline';
     document.getElementById('up').textContent  = d.last_upload;
+    document.getElementById('photopend').textContent = d.photos_pending;
     document.getElementById('devid').textContent = d.device_id + (d.time ? ' \u00B7 '+d.time : '');
   }catch(e){}
 }
@@ -471,6 +594,20 @@ function confirmClear(){
     act('/clear','Erasing...');
   }
 }
+document.getElementById('photoFile').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';   // let the same photo be re-picked later if the upload fails
+  if(!file) return;
+  const msg = document.getElementById('photomsg');
+  msg.textContent = 'Uploading photo...';
+  try{
+    const fd = new FormData();
+    fd.append('photo', file, file.name || 'photo.jpg');
+    const r = await fetch('/photo', {method:'POST', body: fd});
+    msg.textContent = await r.text();
+  }catch(err){ msg.textContent = 'Photo upload failed'; }
+  poll();
+});
 syncTime().then(poll); setInterval(poll, 2000);
 </script>
 </body></html>
@@ -498,6 +635,7 @@ void handleApi() {
   j += ",\"pending\":"      + String((unsigned long)pending);
   j += ",\"online\":"       + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   j += ",\"last_upload\":\""+ lastUploadStatus + "\"";
+  j += ",\"photos_pending\":"+ String(countPendingPhotos());
   j += ",\"device_id\":\""  + String(DEVICE_ID) + "\"";
   j += ",\"time\":\""       + isoTimestamp() + "\"";
   j += "}";
@@ -558,8 +696,64 @@ void handleDownload() {
 
 void handleUploadNow() {
   bool ok = uploadPending();
-  server.send(200, "text/plain", ok ? ("Upload: " + lastUploadStatus)
-                                    : ("Upload failed: " + lastUploadStatus));
+  bool photosOk = uploadPendingPhotos();
+  String msg = ok ? ("Upload: " + lastUploadStatus) : ("Upload failed: " + lastUploadStatus);
+  msg += photosOk ? " | Photos: up to date" : " | Photos: some failed, will retry";
+  server.send(200, "text/plain", msg);
+}
+
+// Multipart file-upload handler for POST /photo. Called repeatedly by the
+// WebServer library as the phone's upload streams in, so the file is
+// written to SD chunk by chunk rather than buffered whole in RAM - the
+// same reason uploadPendingPhotos() streams via Stream* on the way out.
+void handlePhotoUpload() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    photoUploadBytes = 0;
+    photoUploadOk = sdReady;
+    if (!photoUploadOk) { Serial.println("[PHOTO] Rejecting upload - SD not ready."); return; }
+
+    photoSeq++;
+    prefs.putULong("photoSeq", photoSeq);
+    String epoch = timeIsSynced() ? String((unsigned long)time(nullptr)) : "0";
+    photoUploadPath = String(PHOTO_QUEUE_DIR) + "/" + epoch + "_" + String(photoSeq) + ".jpg";
+
+    photoUploadFile = SD.open(photoUploadPath, FILE_WRITE);
+    if (!photoUploadFile) {
+      Serial.printf("[PHOTO] Failed to open %s for writing.\n", photoUploadPath.c_str());
+      photoUploadOk = false;
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!photoUploadOk) return;
+    if (photoUploadBytes + upload.currentSize > MAX_PHOTO_BYTES) {
+      Serial.println("[PHOTO] Upload exceeds size cap - aborting.");
+      photoUploadOk = false;
+      photoUploadFile.close();
+      SD.remove(photoUploadPath);
+      return;
+    }
+    photoUploadFile.write(upload.buf, upload.currentSize);
+    photoUploadBytes += upload.currentSize;
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (photoUploadFile) photoUploadFile.close();
+    if (photoUploadOk) {
+      Serial.printf("[PHOTO] Saved %s (%u bytes)\n", photoUploadPath.c_str(), (unsigned)photoUploadBytes);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (photoUploadFile) photoUploadFile.close();
+    SD.remove(photoUploadPath);
+    photoUploadOk = false;
+  }
+}
+
+// Runs once handlePhotoUpload() has fully consumed the request body.
+void handlePhotoDone() {
+  if (photoUploadOk) {
+    server.send(200, "text/plain", "Photo saved - will upload to database soon.");
+  } else {
+    server.send(503, "text/plain", "Photo upload failed (SD not ready, or file too large).");
+  }
 }
 
 void handleClear() {
@@ -593,6 +787,7 @@ void setup() {
   uploadOffset   = prefs.getULong("upOffset", 0);
   lastUploadYday = prefs.getInt("upYday", -1);
   lastClearMon   = prefs.getInt("clrMon", -1);
+  photoSeq       = prefs.getULong("photoSeq", 0);
   Serial.printf("[NVS] Restored upload offset: %u bytes\n", uploadOffset);
 
   // --- AHT20 ---
@@ -604,7 +799,10 @@ void setup() {
 
   // --- SD ---
   sdReady = initSDCard();
-  if (sdReady) ensureLogHeader();
+  if (sdReady) {
+    ensureLogHeader();
+    SD.mkdir(PHOTO_QUEUE_DIR);   // no-op if it already exists
+  }
 
   // --- WiFi: AP always, station only if credentials were provided ---
   bool wantUplink = (strlen(STA_SSID) > 0);
@@ -645,6 +843,7 @@ void setup() {
   server.on("/download",   HTTP_GET,  handleDownload);
   server.on("/upload-now", HTTP_POST, handleUploadNow);
   server.on("/clear",      HTTP_POST, handleClear);
+  server.on("/photo",      HTTP_POST, handlePhotoDone, handlePhotoUpload);
 
   server.begin();
   Serial.println("[HTTP] Web server started.");

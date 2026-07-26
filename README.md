@@ -159,9 +159,11 @@ Revisit with a retention policy or a rollup table only if that changes.
 
 ## Dashboard
 
-Not built for v1. `GET /api/readings` is the verification surface; a chart
-UI is a separate, optional follow-up and wasn't cheap enough to justify
-bundling in here.
+A Next.js dashboard lives in [dashboard/](dashboard/) — stat tiles, a line
+chart per metric, the raw readings table, and a photo gallery, all reading
+from `GET /api/readings` / `GET /api/photos` server-side (the API key never
+reaches the browser). See [dashboard/README.md](dashboard/README.md) for
+setup and Vercel deploy steps.
 
 ## Testing
 

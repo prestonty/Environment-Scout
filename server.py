@@ -4,6 +4,10 @@ Ingestion server for the ESP32 environmental logger.
 Endpoints:
   POST /api/readings  - device upload (CSV body, API-key + device-id headers)
   GET  /api/readings   - read back stored rows (verification / dashboard use)
+  POST /api/photos     - device upload (raw JPEG body, API-key + device-id/
+                         filename/taken-at headers); stored in Supabase
+                         Storage, metadata in the `photos` table
+  GET  /api/photos     - read back stored photo metadata + signed URLs
   GET  /health         - trivial liveness check
 
 Contract this must honor (see build spec): a 2xx response is a durability
@@ -22,6 +26,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -37,6 +42,21 @@ API_KEY = os.environ["API_KEY"]
 READ_API_KEY = os.environ.get("READ_API_KEY", API_KEY)
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Photo storage: a private Supabase Storage bucket. The service-role key
+# bypasses the bucket's access policy, same role BYPASSRLS plays for the DB
+# connection, so callers only ever get in through this server.
+#
+# Optional (.get, not []): unlike API_KEY/DATABASE_URL, a missing photo
+# config should only take down the photo endpoints, not the whole service -
+# readings upload has no dependency on Supabase Storage and must keep
+# working even if this was never configured.
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_PHOTOS_BUCKET = os.environ.get("SUPABASE_PHOTOS_BUCKET", "photos")
+PHOTOS_CONFIGURED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+SIGNED_URL_EXPIRES_S = 3600
+
 # The device's `timestamp` field is naive local time with no offset, and the
 # device itself is fixed in the US Eastern zone (EST5EDT in the firmware's
 # TZ_INFO). We interpret it as America/New_York and convert to UTC before
@@ -46,6 +66,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 DEVICE_TZ = ZoneInfo("America/New_York")
 
 MAX_BODY_BYTES = 1_000_000  # generous vs. the ~2 KB the device actually sends
+MAX_PHOTO_BYTES = 15_000_000  # matches the firmware's own SD-fill guard
 
 
 # ── DB pool lifecycle ────────────────────────────────────────────────────
@@ -53,10 +74,12 @@ MAX_BODY_BYTES = 1_000_000  # generous vs. the ~2 KB the device actually sends
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+    app.state.http = httpx.AsyncClient(timeout=30.0)
     try:
         yield
     finally:
         await app.state.pool.close()
+        await app.state.http.aclose()
 
 
 app = FastAPI(title="Environmental Logger Ingest", lifespan=lifespan)
@@ -144,6 +167,42 @@ async def insert_readings(pool: asyncpg.Pool, device_id: str, rows: list[tuple])
     return len(inserted)
 
 
+INSERT_PHOTO_SQL = """
+insert into photos (device_id, filename, taken_at, content_type, size_bytes, storage_path)
+values ($1, $2, $3, $4, $5, $6)
+on conflict (device_id, filename) do nothing
+"""
+
+
+# ── Supabase Storage helpers ─────────────────────────────────────────────
+# Talked to directly over its REST API (rather than the supabase-py SDK) to
+# keep the same "raw client against a documented API" style as the asyncpg
+# calls above.
+
+def _storage_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+
+async def upload_photo(client: httpx.AsyncClient, path: str, content: bytes, content_type: str):
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_PHOTOS_BUCKET}/{path}"
+    headers = {**_storage_headers(), "Content-Type": content_type, "x-upsert": "true"}
+    resp = await client.post(url, headers=headers, content=content)
+    resp.raise_for_status()
+
+
+async def sign_photo_url(client: httpx.AsyncClient, path: str) -> str | None:
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_PHOTOS_BUCKET}/{path}"
+    resp = await client.post(url, headers=_storage_headers(), json={"expiresIn": SIGNED_URL_EXPIRES_S})
+    if resp.status_code != 200:
+        logger.warning("Signed URL request failed for %s: %d %s", path, resp.status_code, resp.text)
+        return None
+    signed = resp.json().get("signedURL")
+    return f"{SUPABASE_URL}/storage/v1{signed}" if signed else None
+
+
 # ── Auth helpers ─────────────────────────────────────────────────────────
 
 def _check_key(provided: str, expected: str):
@@ -226,3 +285,107 @@ async def read_readings(
         records = await conn.fetch(sql, *args)
 
     return [dict(r) for r in records]
+
+
+@app.post("/api/photos")
+async def ingest_photo(
+    request: Request,
+    x_api_key: str = Header(...),
+    x_device_id: str = Header(...),
+    x_filename: str = Header(...),
+    x_taken_at: str | None = Header(default=None),
+):
+    _check_key(x_api_key, API_KEY)
+
+    if not PHOTOS_CONFIGURED:
+        raise HTTPException(status_code=503, detail="photo storage not configured on server")
+
+    if not x_device_id.strip():
+        raise HTTPException(status_code=400, detail="missing X-Device-Id")
+    if not x_filename.strip() or "/" in x_filename:
+        raise HTTPException(status_code=400, detail="missing or invalid X-Filename")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    if len(body) > MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=400, detail="photo too large")
+
+    taken_at = None
+    if x_taken_at and x_taken_at.strip():
+        try:
+            taken_at = _parse_timestamp(x_taken_at)
+        except CSVParseError:
+            raise HTTPException(status_code=400, detail=f"bad X-Taken-At: {x_taken_at!r}")
+
+    storage_path = f"{x_device_id}/{x_filename}"
+
+    try:
+        await upload_photo(request.app.state.http, storage_path, body, "image/jpeg")
+    except Exception:
+        logger.exception(
+            "Storage upload failed for device_id=%s filename=%s", x_device_id, x_filename
+        )
+        raise HTTPException(status_code=500, detail="storage error, retry later")
+
+    try:
+        async with request.app.state.pool.acquire() as conn:
+            await conn.execute(
+                INSERT_PHOTO_SQL,
+                x_device_id, x_filename, taken_at, "image/jpeg", len(body), storage_path,
+            )
+    except Exception:
+        logger.exception(
+            "DB write failed for photo device_id=%s filename=%s", x_device_id, x_filename
+        )
+        raise HTTPException(status_code=500, detail="database error, retry later")
+
+    return JSONResponse(status_code=200, content={"stored": True, "storage_path": storage_path})
+
+
+@app.get("/api/photos")
+async def read_photos(
+    request: Request,
+    x_api_key: str = Header(...),
+    device_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+):
+    _check_key(x_api_key, READ_API_KEY)
+
+    clauses = []
+    args: list = []
+
+    if device_id is not None:
+        args.append(device_id)
+        clauses.append(f"device_id = ${len(args)}")
+    if since is not None:
+        args.append(since)
+        clauses.append(f"received_at >= ${len(args)}")
+    if until is not None:
+        args.append(until)
+        clauses.append(f"received_at <= ${len(args)}")
+
+    where = f"where {' and '.join(clauses)}" if clauses else ""
+    args.append(limit)
+    sql = f"""
+        select id, device_id, filename, taken_at, content_type, size_bytes, storage_path, received_at
+        from photos
+        {where}
+        order by received_at desc
+        limit ${len(args)}
+    """
+
+    async with request.app.state.pool.acquire() as conn:
+        records = await conn.fetch(sql, *args)
+
+    client = request.app.state.http
+    results = []
+    for r in records:
+        row = dict(r)
+        # Metadata rows can still be listed even if Storage was never
+        # configured; just can't produce a URL to view the image at.
+        row["signed_url"] = await sign_photo_url(client, row["storage_path"]) if PHOTOS_CONFIGURED else None
+        results.append(row)
+    return results
